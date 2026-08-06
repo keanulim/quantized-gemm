@@ -1,0 +1,13 @@
+build/
+dist/
+*.o
+*.so
+*.dylib
+*.exe
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.DS_Store
+*.swp
