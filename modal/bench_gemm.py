@@ -48,6 +48,7 @@ def run_int8_gemm_benchmark() -> int:
         "src/reference/gemm.cpp",
         "-o",
         "bench_int8_gemm",
+        "-lcublas",
     ]
 
     print("=== Compiling benchmark ===")

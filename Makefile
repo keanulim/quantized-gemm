@@ -29,7 +29,7 @@ bench: $(BENCH_BIN)
 
 $(BENCH_BIN): $(TEST_SRCS)
 	@mkdir -p build
-	$(NVCC) $(CXXFLAGS) $(INCLUDES) $(BENCH_DEFINES) $(TEST_SRCS) -o $(BENCH_BIN)
+	$(NVCC) $(CXXFLAGS) $(INCLUDES) $(BENCH_DEFINES) $(TEST_SRCS) -o $(BENCH_BIN) -lcublas
 
 run-bench: bench
 	./$(BENCH_BIN)

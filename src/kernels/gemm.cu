@@ -4,6 +4,8 @@
 #include <iostream>
 #include <vector>
 
+#include <cublas_v2.h>
+
 #include "../reference/gemm.h"
 #include "gemm.h"
 
@@ -231,6 +233,153 @@ static float gflops(int M, int N, int K, float ms) {
     return static_cast<float>(ops / (static_cast<double>(ms) * 1e6));
 }
 
+static void launch_custom_gemm(
+    const int8_t* d_A, const int8_t* d_B, int32_t* d_C, int M, int N, int K) {
+    const dim3 dimBlock(16, 16);
+    const dim3 dimGridGemm((N + 15) / 16, (M + 15) / 16);
+    gemm<<<dimGridGemm, dimBlock>>>(d_A, d_B, d_C, M, N, K);
+}
+
+// Row-major C[M×N] = A[M×K] × B[K×N] with INT32 output.
+static void launch_cublas_int8_gemm(
+    cublasHandle_t handle, const int8_t* d_A, const int8_t* d_B, int32_t* d_C,
+    int M, int N, int K) {
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    cublasGemmEx(
+        handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        N,
+        M,
+        K,
+        &alpha,
+        d_B,
+        CUDA_R_8I,
+        N,
+        d_A,
+        CUDA_R_8I,
+        K,
+        &beta,
+        d_C,
+        CUDA_R_32I,
+        N,
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+static bool verify_cublas_matches_custom(int M, int N, int K) {
+    const int sizeq_A = M * K * static_cast<int>(sizeof(int8_t));
+    const int sizeq_B = K * N * static_cast<int>(sizeof(int8_t));
+    const int sizeC_int = M * N * static_cast<int>(sizeof(int32_t));
+
+    int8_t* d_A = nullptr;
+    int8_t* d_B = nullptr;
+    int32_t* d_C_custom = nullptr;
+    int32_t* d_C_cublas = nullptr;
+
+    cudaMalloc(&d_A, sizeq_A);
+    cudaMalloc(&d_B, sizeq_B);
+    cudaMalloc(&d_C_custom, sizeC_int);
+    cudaMalloc(&d_C_cublas, sizeC_int);
+
+    std::vector<int8_t> h_A(M * K);
+    std::vector<int8_t> h_B(K * N);
+    for (int i = 0; i < M * K; ++i) {
+        h_A[i] = static_cast<int8_t>((i * 7 + 3) % 31 - 15);
+    }
+    for (int i = 0; i < K * N; ++i) {
+        h_B[i] = static_cast<int8_t>((i * 5 + 1) % 23 - 11);
+    }
+
+    cudaMemcpy(d_A, h_A.data(), sizeq_A, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B.data(), sizeq_B, cudaMemcpyHostToDevice);
+    cudaMemset(d_C_custom, 0, sizeC_int);
+    cudaMemset(d_C_cublas, 0, sizeC_int);
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+
+    launch_custom_gemm(d_A, d_B, d_C_custom, M, N, K);
+    launch_cublas_int8_gemm(handle, d_A, d_B, d_C_cublas, M, N, K);
+    cudaDeviceSynchronize();
+
+    std::vector<int32_t> h_custom(M * N);
+    std::vector<int32_t> h_cublas(M * N);
+    cudaMemcpy(h_custom.data(), d_C_custom, sizeC_int, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_cublas.data(), d_C_cublas, sizeC_int, cudaMemcpyDeviceToHost);
+
+    cublasDestroy(handle);
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C_custom);
+    cudaFree(d_C_cublas);
+
+    for (int i = 0; i < M * N; ++i) {
+        if (h_custom[i] != h_cublas[i]) {
+            std::cout << "cuBLAS mismatch at " << i << ": custom=" << h_custom[i]
+                      << " cublas=" << h_cublas[i] << "\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static float time_custom_gemm_ms(
+    const int8_t* d_A, const int8_t* d_B, int32_t* d_C,
+    int M, int N, int K, int warmup_iters, int bench_iters) {
+    for (int i = 0; i < warmup_iters; ++i) {
+        launch_custom_gemm(d_A, d_B, d_C, M, N, K);
+    }
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for (int i = 0; i < bench_iters; ++i) {
+        launch_custom_gemm(d_A, d_B, d_C, M, N, K);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float total_ms = 0.f;
+    cudaEventElapsedTime(&total_ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return total_ms / static_cast<float>(bench_iters);
+}
+
+static float time_cublas_gemm_ms(
+    cublasHandle_t handle, const int8_t* d_A, const int8_t* d_B, int32_t* d_C,
+    int M, int N, int K, int warmup_iters, int bench_iters) {
+    for (int i = 0; i < warmup_iters; ++i) {
+        launch_cublas_int8_gemm(handle, d_A, d_B, d_C, M, N, K);
+    }
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for (int i = 0; i < bench_iters; ++i) {
+        launch_cublas_int8_gemm(handle, d_A, d_B, d_C, M, N, K);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float total_ms = 0.f;
+    cudaEventElapsedTime(&total_ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    return total_ms / static_cast<float>(bench_iters);
+}
+
 void benchmark_gemm_kernel(int M, int K, int N, int warmup_iters, int bench_iters) {
     const int sizeq_A = M * K * static_cast<int>(sizeof(int8_t));
     const int sizeq_B = K * N * static_cast<int>(sizeof(int8_t));
@@ -247,35 +396,43 @@ void benchmark_gemm_kernel(int M, int K, int N, int warmup_iters, int bench_iter
     cudaMemset(d_q_B, 1, sizeq_B);
     cudaMemset(d_C_int, 0, sizeC_int);
 
-    const dim3 dimBlock(16, 16);
-    const dim3 dimGridGemm((N + 15) / 16, (M + 15) / 16);
-
-    for (int i = 0; i < warmup_iters; ++i) {
-        gemm<<<dimGridGemm, dimBlock>>>(d_q_A, d_q_B, d_C_int, M, N, K);
-    }
-    cudaDeviceSynchronize();
-
-    cudaEvent_t start;
-    cudaEvent_t stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    cudaEventRecord(start);
-    for (int i = 0; i < bench_iters; ++i) {
-        gemm<<<dimGridGemm, dimBlock>>>(d_q_A, d_q_B, d_C_int, M, N, K);
-    }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-
-    float total_ms = 0.f;
-    cudaEventElapsedTime(&total_ms, start, stop);
-    const float avg_ms = total_ms / static_cast<float>(bench_iters);
+    const float avg_ms = time_custom_gemm_ms(
+        d_q_A, d_q_B, d_C_int, M, N, K, warmup_iters, bench_iters);
 
     std::cout << M << "," << K << "," << N << "," << avg_ms << ","
               << gflops(M, N, K, avg_ms) << "\n";
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    cudaFree(d_q_A);
+    cudaFree(d_q_B);
+    cudaFree(d_C_int);
+}
+
+void benchmark_cublas_gemm_kernel(int M, int K, int N, int warmup_iters, int bench_iters) {
+    const int sizeq_A = M * K * static_cast<int>(sizeof(int8_t));
+    const int sizeq_B = K * N * static_cast<int>(sizeof(int8_t));
+    const int sizeC_int = M * N * static_cast<int>(sizeof(int32_t));
+
+    int8_t *d_q_A = nullptr;
+    int8_t *d_q_B = nullptr;
+    int32_t *d_C_int = nullptr;
+
+    cudaMalloc(&d_q_A, sizeq_A);
+    cudaMalloc(&d_q_B, sizeq_B);
+    cudaMalloc(&d_C_int, sizeC_int);
+    cudaMemset(d_q_A, 1, sizeq_A);
+    cudaMemset(d_q_B, 1, sizeq_B);
+    cudaMemset(d_C_int, 0, sizeC_int);
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+
+    const float avg_ms = time_cublas_gemm_ms(
+        handle, d_q_A, d_q_B, d_C_int, M, N, K, warmup_iters, bench_iters);
+
+    std::cout << M << "," << K << "," << N << "," << avg_ms << ","
+              << gflops(M, N, K, avg_ms) << "\n";
+
+    cublasDestroy(handle);
     cudaFree(d_q_A);
     cudaFree(d_q_B);
     cudaFree(d_C_int);
@@ -286,14 +443,58 @@ static int run_int8_gemm_benchmarks() {
     const int warmup_iters = 5;
     const int bench_iters = 100;
 
-    std::cout << "INT8 tiled GEMM kernel benchmark\n";
+    std::cout << "INT8 GEMM kernel benchmark (custom tiled vs cuBLAS)\n";
     std::cout << "warmup_iters=" << warmup_iters << " bench_iters=" << bench_iters << "\n";
-    std::cout << "M,K,N,avg_ms,gflops\n";
+
+    if (!verify_cublas_matches_custom(128, 128, 128)) {
+        std::cout << "cuBLAS correctness check FAILED\n";
+        return 1;
+    }
+    std::cout << "cuBLAS correctness check passed (128x128 INT32 match)\n\n";
+
+    std::cout << "M,K,N,custom_ms,custom_gflops,cublas_ms,cublas_gflops,cublas_speedup\n";
+
+    cublasHandle_t handle;
+    cublasCreate(&handle);
 
     for (int n : sizes) {
-        benchmark_gemm_kernel(n, n, n, warmup_iters, bench_iters);
+        const int M = n;
+        const int K = n;
+        const int N = n;
+        const int sizeq_A = M * K * static_cast<int>(sizeof(int8_t));
+        const int sizeq_B = K * N * static_cast<int>(sizeof(int8_t));
+        const int sizeC_int = M * N * static_cast<int>(sizeof(int32_t));
+
+        int8_t* d_A = nullptr;
+        int8_t* d_B = nullptr;
+        int32_t* d_C = nullptr;
+        cudaMalloc(&d_A, sizeq_A);
+        cudaMalloc(&d_B, sizeq_B);
+        cudaMalloc(&d_C, sizeC_int);
+        cudaMemset(d_A, 1, sizeq_A);
+        cudaMemset(d_B, 1, sizeq_B);
+        cudaMemset(d_C, 0, sizeC_int);
+
+        const float custom_ms = time_custom_gemm_ms(
+            d_A, d_B, d_C, M, N, K, warmup_iters, bench_iters);
+        const float cublas_ms = time_cublas_gemm_ms(
+            handle, d_A, d_B, d_C, M, N, K, warmup_iters, bench_iters);
+
+        const float custom_gflops = gflops(M, N, K, custom_ms);
+        const float cublas_gflops = gflops(M, N, K, cublas_ms);
+        const float speedup = custom_ms / cublas_ms;
+
+        std::cout << M << "," << K << "," << N << ","
+                  << custom_ms << "," << custom_gflops << ","
+                  << cublas_ms << "," << cublas_gflops << ","
+                  << speedup << "\n";
+
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
     }
 
+    cublasDestroy(handle);
     return 0;
 }
 
