@@ -144,6 +144,7 @@ void gemm_launch(const float *A, const float *B, float *C, int M, int K, int N){
     cudaFree(d_C_int);
 }
 
+#ifdef RUN_INT8_GEMM_TEST
 static float max_abs_diff(const float* a, const float* b, int n) {
     float max_diff = 0.f;
     for (int i = 0; i < n; ++i) {
@@ -220,8 +221,87 @@ static int run_int8_gemm_tests() {
     std::cout << (ok ? "\nAll tests passed.\n" : "\nSome tests failed.\n");
     return ok ? 0 : 1;
 }
+#endif
 
-#ifdef RUN_INT8_GEMM_TEST
+static float gflops(int M, int N, int K, float ms) {
+    if (ms <= 0.f) {
+        return 0.f;
+    }
+    const double ops = 2.0 * static_cast<double>(M) * N * K;
+    return static_cast<float>(ops / (static_cast<double>(ms) * 1e6));
+}
+
+void benchmark_gemm_kernel(int M, int K, int N, int warmup_iters, int bench_iters) {
+    const int sizeq_A = M * K * static_cast<int>(sizeof(int8_t));
+    const int sizeq_B = K * N * static_cast<int>(sizeof(int8_t));
+    const int sizeC_int = M * N * static_cast<int>(sizeof(int32_t));
+
+    int8_t *d_q_A = nullptr;
+    int8_t *d_q_B = nullptr;
+    int32_t *d_C_int = nullptr;
+
+    cudaMalloc(&d_q_A, sizeq_A);
+    cudaMalloc(&d_q_B, sizeq_B);
+    cudaMalloc(&d_C_int, sizeC_int);
+    cudaMemset(d_q_A, 1, sizeq_A);
+    cudaMemset(d_q_B, 1, sizeq_B);
+    cudaMemset(d_C_int, 0, sizeC_int);
+
+    const dim3 dimBlock(16, 16);
+    const dim3 dimGridGemm((N + 15) / 16, (M + 15) / 16);
+
+    for (int i = 0; i < warmup_iters; ++i) {
+        gemm<<<dimGridGemm, dimBlock>>>(d_q_A, d_q_B, d_C_int, M, N, K);
+    }
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start);
+    for (int i = 0; i < bench_iters; ++i) {
+        gemm<<<dimGridGemm, dimBlock>>>(d_q_A, d_q_B, d_C_int, M, N, K);
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float total_ms = 0.f;
+    cudaEventElapsedTime(&total_ms, start, stop);
+    const float avg_ms = total_ms / static_cast<float>(bench_iters);
+
+    std::cout << M << "," << K << "," << N << "," << avg_ms << ","
+              << gflops(M, N, K, avg_ms) << "\n";
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaFree(d_q_A);
+    cudaFree(d_q_B);
+    cudaFree(d_C_int);
+}
+
+static int run_int8_gemm_benchmarks() {
+    const int sizes[] = {256, 512, 1024, 2048, 4096};
+    const int warmup_iters = 5;
+    const int bench_iters = 100;
+
+    std::cout << "INT8 tiled GEMM kernel benchmark\n";
+    std::cout << "warmup_iters=" << warmup_iters << " bench_iters=" << bench_iters << "\n";
+    std::cout << "M,K,N,avg_ms,gflops\n";
+
+    for (int n : sizes) {
+        benchmark_gemm_kernel(n, n, n, warmup_iters, bench_iters);
+    }
+
+    return 0;
+}
+
+#ifdef RUN_INT8_GEMM_BENCH
+int main() {
+    return run_int8_gemm_benchmarks();
+}
+#elif defined(RUN_INT8_GEMM_TEST)
 int main() {
     return run_int8_gemm_tests();
 }
